@@ -430,6 +430,31 @@ AbstractController::mapAddressToMachine(Addr addr, MachineType mtype) const
     return mach;
 }
 
+NetDest
+AbstractController::multicastDestination(PacketPtr pkt, MachineType mtype,
+                                         Addr addr)
+{
+    assert(m_ruby_system != nullptr);
+    NetDest dest(m_ruby_system);
+
+    if (pkt != nullptr && pkt->req && pkt->req->extraDataValid()) {
+        uint64_t mask = pkt->req->getExtraData();
+        NodeID type_count = m_ruby_system->MachineType_base_count(mtype);
+        for (NodeID i = 0; i < type_count && i < 64; i++) {
+            if (mask & (uint64_t(1) << i)) {
+                MachineID mach = {mtype, i};
+                dest.add(mach);
+            }
+        }
+    }
+
+    if (dest.isEmpty()) {
+        dest.add(mapAddressToMachine(addr, mtype));
+    }
+
+    return dest;
+}
+
 MachineID
 AbstractController::mapAddressToDownstreamMachine(Addr addr, MachineType mtype)
 const

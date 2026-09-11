@@ -30,7 +30,9 @@
 #ifndef __MEM_RUBY_NETWORK_BETAAR_0_COMMONTYPES_HH__
 #define __MEM_RUBY_NETWORK_BETAAR_0_COMMONTYPES_HH__
 
+#include "base/logging.hh"
 #include "mem/ruby/common/NetDest.hh"
+#include "mem/ruby/system/RubySystem.hh"
 
 namespace gem5
 {
@@ -102,16 +104,59 @@ struct RouteInfo
     {}
 
     // destination format for table-based routing
+    // NOTE: net_dest may legitimately hold MORE THAN ONE destination when
+    // routing_algorithm == XY_ -- this is what carries a multicast message's
+    // full destination set through the network. RoutingUnit is responsible
+    // for splitting/narrowing it hop by hop (see outportComputeMulticastXY).
     int vnet;
     NetDest net_dest;
 
     // src and dest format for topology-specific routing
+    // NOTE: dest_ni/dest_router are only meaningful as a *representative*
+    // destination (used by TABLE_/CUSTOM_ routing, which are unicast-only,
+    // and by stats). For XY_ multicast routing, net_dest is authoritative.
     int src_ni;
     int src_router;
     int dest_ni;
     int dest_router;
     int hops_traversed;
 };
+
+// One outgoing branch of a (possibly multicast) routing decision: the
+// subset of a flit's destinations that should leave a router via outport,
+// as computed by RoutingUnit::outportCompute(). A unicast route produces
+// exactly one RouteBranch; a multicast route bucketed across several
+// directions (see outportComputeMulticastXY) produces one per non-empty
+// bucket.
+struct RouteBranch
+{
+    RouteBranch(int outport_, const NetDest &dest_subset_)
+        : outport(outport_), dest_subset(dest_subset_)
+    {}
+    int outport;
+    NetDest dest_subset;
+};
+
+// Converts a flat NodeID (as returned by NetDest::getAllDest()) back into
+// the MachineID it was derived from. Factored out of NetworkInterface's
+// old per-destination flitisize loop so RoutingUnit can reuse it when
+// bucketing a multicast NetDest by destination router coordinates.
+inline MachineID
+nodeIDToMachineID(RubySystem *ruby_system, NodeID id)
+{
+    for (int m = 0; m < (int)MachineType_NUM; m++) {
+        if ((id >= ruby_system->MachineType_base_number((MachineType)m)) &&
+            id < ruby_system->MachineType_base_number((MachineType)(m + 1))) {
+            MachineID mid;
+            mid.type = (MachineType)m;
+            mid.num =
+                id - ruby_system->MachineType_base_number((MachineType)m);
+            return mid;
+        }
+    }
+    panic("nodeIDToMachineID: NodeID %d out of range", id);
+    return MachineID();
+}
 
 #define INFINITE_ 10000
 

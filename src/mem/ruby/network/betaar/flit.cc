@@ -73,6 +73,25 @@ flit::flit(int packet_id, int id, int vc, int vnet, RouteInfo route, int size,
     }
 }
 
+flit::flit(const flit &other)
+    : m_width(other.m_width),
+      msgSize(other.msgSize),
+      m_packet_id(other.m_packet_id),
+      m_id(other.m_id),
+      m_vnet(other.m_vnet),
+      m_vc(other.m_vc),
+      m_route(other.m_route),
+      m_size(other.m_size),
+      m_enqueue_time(other.m_enqueue_time),
+      m_dequeue_time(other.m_dequeue_time),
+      m_time(other.m_time),
+      m_type(other.m_type),
+      m_msg_ptr(other.m_msg_ptr),
+      m_outport(other.m_outport),
+      src_delay(other.src_delay),
+      m_stage(other.m_stage)
+{}
+
 flit *
 flit::serialize(int ser_id, int parts, uint32_t bWidth)
 {

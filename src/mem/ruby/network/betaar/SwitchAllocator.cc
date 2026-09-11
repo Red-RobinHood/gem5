@@ -30,6 +30,8 @@
 
 #include "mem/ruby/network/betaar/SwitchAllocator.hh"
 
+#include <algorithm>
+
 #include "debug/RubyNetwork.hh"
 #include "mem/ruby/network/betaar/BetaarNetwork.hh"
 #include "mem/ruby/network/betaar/InputUnit.hh"
@@ -67,7 +69,7 @@ SwitchAllocator::init()
 
     for (int i = 0; i < m_num_inports; i++) {
         m_round_robin_invc[i] = 0;
-        m_port_requests[i] = -1;
+        m_port_requests[i].clear();
         m_vc_winners[i] = -1;
     }
 
@@ -102,7 +104,11 @@ SwitchAllocator::wakeup()
  *     has at least one free output VC.
  *    - For BODY/TAIL flits, only selects an input VC that has credits
  *      in its output VC.
- * Places a request for the output port from this input VC.
+ * Places a request for every output port this input VC still needs to send
+ * the flit at the head of its buffer to. A unicast flit has exactly one
+ * such branch; a multicast flit that forks here has one per direction its
+ * remaining destinations require, minus any branch already sent in an
+ * earlier cycle (independent per-branch retirement).
  */
 
 void
@@ -119,16 +125,24 @@ SwitchAllocator::arbitrate_inports()
             if (input_unit->need_stage(invc, SA_, curTick())) {
                 // This flit is in SA stage
 
-                int outport = input_unit->get_outport(invc);
-                int outvc = input_unit->get_outvc(invc);
+                std::vector<int> requested_outports;
+                for (auto &br : input_unit->get_branches(invc)) {
+                    if (br.granted_this_flit) {
+                        // this branch already left in an earlier cycle
+                        continue;
+                    }
 
-                // check if the flit in this InputVC is allowed to be sent
-                // send_allowed conditions described in that function.
-                bool make_request = send_allowed(inport, invc, outport, outvc);
+                    // check if the flit in this InputVC is allowed to be
+                    // sent out this branch's outport.
+                    // send_allowed conditions described in that function.
+                    if (send_allowed(inport, invc, br.outport, br.outvc)) {
+                        requested_outports.push_back(br.outport);
+                    }
+                }
 
-                if (make_request) {
+                if (!requested_outports.empty()) {
                     m_input_arbiter_activity++;
-                    m_port_requests[inport] = outport;
+                    m_port_requests[inport] = requested_outports;
                     m_vc_winners[inport] = invc;
 
                     break; // got one vc winner for this port
@@ -169,21 +183,71 @@ SwitchAllocator::arbitrate_outports()
         for (int inport_iter = 0; inport_iter < m_num_inports; inport_iter++) {
 
             // inport has a request this cycle for outport
-            if (m_port_requests[inport] == outport) {
+            auto req = std::find(m_port_requests[inport].begin(),
+                                 m_port_requests[inport].end(), outport);
+            if (req != m_port_requests[inport].end()) {
                 auto output_unit = m_router->getOutputUnit(outport);
                 auto input_unit = m_router->getInputUnit(inport);
 
                 // grant this outport to this inport
                 int invc = m_vc_winners[inport];
 
-                int outvc = input_unit->get_outvc(invc);
-                if (outvc == -1) {
-                    // VC Allocation - select any free VC from outport
-                    outvc = vc_allocate(outport, inport, invc);
+                auto &branches = input_unit->get_branches(invc);
+                auto br_it =
+                    std::find_if(branches.begin(), branches.end(),
+                                 [outport](const VirtualChannel::Branch &b) {
+                                     return b.outport == outport;
+                                 });
+                assert(br_it != branches.end());
+                int br_idx = std::distance(branches.begin(), br_it);
+                auto &br = *br_it;
+                assert(!br.granted_this_flit);
+
+                if (br.outvc == -1) {
+                    // VC Allocation - select any free VC from outport.
+                    // Each branch of a multicast packet gets its own
+                    // output VC at its own outport.
+                    br.outvc = vc_allocate(outport, inport, invc);
+                }
+                int outvc = br.outvc;
+
+                // Is this the last branch of this flit still waiting to be
+                // sent? Only then does the flit actually leave the input
+                // buffer; every earlier branch forwards an independent
+                // copy while the original stays put for the branches that
+                // have not been granted yet.
+                bool is_last_branch = true;
+                for (auto &b : branches) {
+                    if (!b.granted_this_flit && b.outport != outport) {
+                        is_last_branch = false;
+                        break;
+                    }
                 }
 
-                // remove flit from Input VC
-                flit *t_flit = input_unit->getTopFlit(invc);
+                // Peek (don't pop): the shared flit is only removed from
+                // the Input VC once every branch has been sent.
+                flit *src_flit = input_unit->peekTopFlit(invc);
+
+                // Forward an independent copy down every branch but the
+                // last one, leaving the original flit in the buffer for
+                // the branches that have not been granted yet.
+                flit *t_flit = is_last_branch ? src_flit : new flit(*src_flit);
+
+                // Every delivered copy of a multicast message needs its
+                // own Message object, because the destination
+                // MessageBuffer stamps per-delivery bookkeeping onto
+                // whatever Message it is handed. The first branch carries
+                // the packet's original Message and each other branch
+                // carries a clone made once for the whole packet -- keyed
+                // on the branch rather than on which branch happens to win
+                // arbitration last, so every flit of a packet travelling
+                // down a given branch carries the same Message.
+                if (br_idx != 0) {
+                    if (br.branch_msg_ptr == nullptr) {
+                        br.branch_msg_ptr = src_flit->get_msg_ptr()->clone();
+                    }
+                    t_flit->set_msg_ptr(br.branch_msg_ptr);
+                }
 
                 DPRINTF(RubyNetwork,
                         "SwitchAllocator at Router %d "
@@ -198,6 +262,14 @@ SwitchAllocator::arbitrate_outports()
                             input_unit->get_direction()),
                         *t_flit, m_router->curCycle());
 
+                // Narrow this copy's destination set to the subset that
+                // travels down this branch. Downstream routers re-bucket
+                // whatever is left, so the multicast tree keeps pruning
+                // itself hop by hop.
+                RouteInfo branch_route = t_flit->get_route();
+                branch_route.net_dest = br.dest_subset;
+                t_flit->set_route(branch_route);
+
                 // Update outport field in the flit since this is
                 // used by CrossbarSwitch code to send it out of
                 // correct outport.
@@ -206,7 +278,8 @@ SwitchAllocator::arbitrate_outports()
                 t_flit->set_outport(outport);
 
                 // set outvc (i.e., invc for next hop) in flit
-                // (This was updated in VC by vc_allocate, but not in flit)
+                // (This was updated in the branch by vc_allocate,
+                // but not in flit)
                 t_flit->set_vc(outvc);
 
                 // decrement credit in outvc
@@ -217,26 +290,42 @@ SwitchAllocator::arbitrate_outports()
                 m_router->grant_switch(inport, t_flit);
                 m_output_arbiter_activity++;
 
-                if ((t_flit->get_type() == TAIL_) ||
-                    t_flit->get_type() == HEAD_TAIL_) {
+                br.granted_this_flit = true;
 
-                    // This Input VC should now be empty
-                    assert(!(input_unit->isReady(invc, curTick())));
+                if (is_last_branch) {
+                    // Every branch has now been sent: the flit really
+                    // leaves this Input VC, and exactly one credit goes
+                    // back upstream for it (the input buffer only ever
+                    // held one flit, however many branches it fanned into)
+                    input_unit->getTopFlit(invc);
 
-                    // Free this VC
-                    input_unit->set_vc_idle(invc, curTick());
+                    if ((t_flit->get_type() == TAIL_) ||
+                        t_flit->get_type() == HEAD_TAIL_) {
 
-                    // Send a credit back
-                    // along with the information that this VC is now idle
-                    input_unit->increment_credit(invc, true, curTick());
-                } else {
-                    // Send a credit back
-                    // but do not indicate that the VC is idle
-                    input_unit->increment_credit(invc, false, curTick());
+                        // This Input VC should now be empty
+                        assert(!(input_unit->isReady(invc, curTick())));
+
+                        // Free this VC
+                        input_unit->set_vc_idle(invc, curTick());
+
+                        // Send a credit back
+                        // along with the information that this VC is now
+                        // idle
+                        input_unit->increment_credit(invc, true, curTick());
+                    } else {
+                        // Re-arm every branch for the next flit of this
+                        // packet (same branch topology and output VCs,
+                        // none of them sent yet for that flit).
+                        input_unit->reset_branch_grants(invc);
+
+                        // Send a credit back
+                        // but do not indicate that the VC is idle
+                        input_unit->increment_credit(invc, false, curTick());
+                    }
                 }
 
                 // remove this request
-                m_port_requests[inport] = -1;
+                m_port_requests[inport].erase(req);
 
                 // Update Round Robin pointer
                 m_round_robin_inport[outport] = inport + 1;
@@ -246,11 +335,15 @@ SwitchAllocator::arbitrate_outports()
 
                 // Update Round Robin pointer to the next VC
                 // We do it here to keep it fair.
-                // Only the VC which got switch traversal
-                // is updated.
-                m_round_robin_invc[inport] = invc + 1;
-                if (m_round_robin_invc[inport] >= m_num_vcs) {
-                    m_round_robin_invc[inport] = 0;
+                // Only the VC which got switch traversal is updated, and
+                // only once it is completely done with this flit -- a
+                // partially forwarded multicast flit keeps its priority so
+                // its remaining branches can drain.
+                if (is_last_branch) {
+                    m_round_robin_invc[inport] = invc + 1;
+                    if (m_round_robin_invc[inport] >= m_num_vcs) {
+                        m_round_robin_invc[inport] = 0;
+                    }
                 }
 
                 break; // got a input winner for this outport
@@ -324,10 +417,17 @@ SwitchAllocator::send_allowed(int inport, int invc, int outport, int outvc)
         int vc_base = vnet * m_vc_per_vnet;
         for (int vc_offset = 0; vc_offset < m_vc_per_vnet; vc_offset++) {
             int temp_vc = vc_base + vc_offset;
-            if (input_unit->need_stage(temp_vc, SA_, curTick()) &&
-                (input_unit->get_outport(temp_vc) == outport) &&
-                (input_unit->get_enqueue_time(temp_vc) < t_enqueue_time)) {
-                return false;
+            if (!input_unit->need_stage(temp_vc, SA_, curTick()) ||
+                (input_unit->get_enqueue_time(temp_vc) >= t_enqueue_time)) {
+                continue;
+            }
+
+            // An older flit at this input port blocks us only if it is
+            // itself still waiting to be sent out this same outport.
+            for (auto &br : input_unit->get_branches(temp_vc)) {
+                if (!br.granted_this_flit && br.outport == outport) {
+                    return false;
+                }
             }
         }
     }
@@ -336,6 +436,8 @@ SwitchAllocator::send_allowed(int inport, int invc, int outport, int outvc)
 }
 
 // Assign a free VC to the winner of the output port.
+// The caller stores it in the branch it was allocated for, since a
+// multicast packet holds one output VC per branch.
 int
 SwitchAllocator::vc_allocate(int outport, int inport, int invc)
 {
@@ -345,7 +447,6 @@ SwitchAllocator::vc_allocate(int outport, int inport, int invc)
 
     // has to get a valid VC since it checked before performing SA
     assert(outvc != -1);
-    m_router->getInputUnit(inport)->grant_outvc(invc, outvc);
     return outvc;
 }
 
@@ -383,7 +484,9 @@ SwitchAllocator::get_vnet(int invc)
 void
 SwitchAllocator::clear_request_vector()
 {
-    std::fill(m_port_requests.begin(), m_port_requests.end(), -1);
+    for (auto &requests : m_port_requests) {
+        requests.clear();
+    }
 }
 
 void

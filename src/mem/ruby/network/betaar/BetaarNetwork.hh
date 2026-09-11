@@ -147,6 +147,11 @@ class BetaarNetwork : public Network
     void print(std::ostream &out) const;
 
     // increment counters
+    // NOTE: a multicast message is injected once but delivered once per
+    // destination, so packets/flits received can legitimately exceed
+    // packets/flits injected on a vnet carrying multicast traffic. The
+    // difference is the replication the network performed; it is not a
+    // leak or a double count.
     void
     increment_injected_packets(int vnet)
     {

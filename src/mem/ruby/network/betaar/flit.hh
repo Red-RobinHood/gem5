@@ -53,6 +53,15 @@ class flit
     flit(int packet_id, int id, int vc, int vnet, RouteInfo route, int size,
          MsgPtr msg_ptr, int MsgSize, uint32_t bWidth, Tick curTime);
 
+    // Used when a multicast flit's destination set forks into multiple
+    // branches at a router: makes an independent copy of this flit (sharing
+    // the same MsgPtr -- the message is never deep-copied) so each branch
+    // can be granted its own outport/outvc and progress through the
+    // network -- and accumulate its own hop count -- on its own from the
+    // fork point onward. Callers overwrite m_route/m_outport/m_vc on the
+    // copy immediately to reflect the specific branch it represents.
+    flit(const flit &other);
+
     virtual ~flit(){};
 
     int
@@ -109,6 +118,11 @@ class flit
     get_msg_ptr()
     {
         return m_msg_ptr;
+    }
+    void
+    set_msg_ptr(MsgPtr msg_ptr)
+    {
+        m_msg_ptr = msg_ptr;
     }
     flit_type
     get_type()

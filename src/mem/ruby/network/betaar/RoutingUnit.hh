@@ -52,24 +52,41 @@ class RoutingUnit
 {
   public:
     RoutingUnit(Router *router);
-    int outportCompute(RouteInfo route, int inport, PortDirection inport_dirn);
+
+    // Always returns >=1 branch. A branch is an (outport, destination
+    // subset) pair: the subset of route.net_dest that should be sent out
+    // that outport from this router. For a single-destination RouteInfo
+    // this degenerates to exactly one branch (today's unicast behavior).
+    // For a multi-destination RouteInfo (routing_algorithm == XY_ only --
+    // see outportComputeMulticastXY), this can return up to 4 branches
+    // (East/West/North/South) plus any Local-delivery branches.
+    std::vector<RouteBranch> outportCompute(RouteInfo route, int inport,
+                                            PortDirection inport_dirn);
 
     // Topology-agnostic Routing Table based routing (default)
     void addRoute(std::vector<NetDest> &routing_table_entry);
     void addWeight(int link_weight);
 
-    // get output port from routing table
+    // get output port from routing table. Unicast-only (net_dest must
+    // contain exactly one destination) -- callers are responsible for
+    // fatal()'ing beforehand if a multicast net_dest reaches TABLE_/CUSTOM_
+    // routing.
     int lookupRoutingTable(int vnet, NetDest net_dest);
 
     // Topology-specific direction based routing
     void addInDirection(PortDirection inport_dirn, int inport);
     void addOutDirection(PortDirection outport_dirn, int outport);
 
-    // Routing for Mesh
-    int outportComputeXY(RouteInfo route, int inport,
-                         PortDirection inport_dirn);
+    // Routing for Mesh. route.net_dest may contain multiple REMOTE
+    // (non-local-to-this-router) destinations; buckets them by required
+    // next-hop direction (East/West/North/South), recomputed fresh from
+    // whatever destination subset this particular flit-branch is still
+    // carrying. Never returns an empty vector.
+    std::vector<RouteBranch>
+    outportComputeMulticastXY(RouteInfo route, int inport,
+                              PortDirection inport_dirn);
 
-    // Custom Routing Algorithm using Port Directions
+    // Custom Routing Algorithm using Port Directions. Unicast-only.
     int outportComputeCustom(RouteInfo route, int inport,
                              PortDirection inport_dirn);
 

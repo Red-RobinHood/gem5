@@ -63,6 +63,9 @@ class SwitchAllocator : public Consumer
     void arbitrate_inports();
     void arbitrate_outports();
     bool send_allowed(int inport, int invc, int outport, int outvc);
+    // Selects (and marks active) a free VC at outport for the given input
+    // VC's vnet. The caller stores the result in the branch it belongs to,
+    // since a multicast packet allocates one output VC per branch.
     int vc_allocate(int outport, int inport, int invc);
 
     inline double
@@ -87,7 +90,11 @@ class SwitchAllocator : public Consumer
     Router *m_router;
     std::vector<int> m_round_robin_invc;
     std::vector<int> m_round_robin_inport;
-    std::vector<int> m_port_requests;
+    // Per inport: every outport requested this cycle by that inport's
+    // winning input VC. A unicast flit requests exactly one outport; a
+    // multicast flit whose destinations fan out requests one per branch
+    // that is still unsent and currently sendable.
+    std::vector<std::vector<int>> m_port_requests;
     std::vector<int> m_vc_winners;
 };
 

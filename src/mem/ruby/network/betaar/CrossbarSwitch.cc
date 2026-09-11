@@ -72,12 +72,16 @@ CrossbarSwitch::wakeup()
             m_router->get_id(), m_router->curCycle());
 
     for (auto &switch_buffer : switchBuffers) {
-        if (!switch_buffer.isReady(curTick())) {
-            continue;
-        }
+        // Drain every flit this inport won a switch grant for this cycle.
+        // A multicast flit that forked here is granted once per branch, so
+        // the same inport can hand several copies (each bound for a
+        // different outport) to the crossbar in the same cycle.
+        while (switch_buffer.isReady(curTick())) {
+            flit *t_flit = switch_buffer.peekTopFlit();
+            if (!t_flit->is_stage(ST_, curTick())) {
+                break;
+            }
 
-        flit *t_flit = switch_buffer.peekTopFlit();
-        if (t_flit->is_stage(ST_, curTick())) {
             int outport = t_flit->get_outport();
 
             // flit performs LT_ in the next cycle

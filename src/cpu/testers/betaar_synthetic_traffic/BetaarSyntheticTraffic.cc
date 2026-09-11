@@ -265,91 +265,106 @@ BetaarSyntheticTraffic::generatePkt()
             "Generated destination set of size %d for source %d\n",
             destinations.size(), source);
 
-    for (unsigned dest : destinations) {
-        // The source of the packets is a cache.
-        // The destination of the packets is a directory.
-        // The destination bits are embedded in the address after
-        // byte-offset.
-        Addr paddr = dest;
-        paddr <<= blockSizeBits;
-        unsigned access_size = 1; // Does not affect Ruby simulation
+    // ONE packet is generated for the whole destination set, even when that
+    // set holds several destinations: the Betaar network delivers a
+    // multicast message as a single flit stream that the routers replicate
+    // internally (see RoutingUnit::outportComputeMulticastXY), so splitting
+    // it into one packet per destination here would defeat the purpose.
+    // The first destination is embedded in the address as usual; the full
+    // set is passed alongside as a bitmask over destination node ids, which
+    // Garnet_standalone-cache.sm turns into a multi-destination NetDest via
+    // AbstractController::multicastDestination().
+    Addr paddr = destinations[0];
+    paddr <<= blockSizeBits;
+    unsigned access_size = 1; // Does not affect Ruby simulation
 
-        // Modeling different coherence msg types over different msg
-        // classes.
-        //
-        // BetaarSyntheticTraffic assumes the Garnet_standalone coherence
-        // protocol which models three message classes/virtual networks.
-        // These are: request, forward, response.
-        // requests and forwards are "control" packets (typically 8 bytes),
-        // while responses are "data" packets (typically 72 bytes).
-        //
-        // Life of a packet from the tester into the network:
-        // (1) This function generatePkt() generates packets of one of the
-        //     following 3 types (randomly) : ReadReq, INST_FETCH, WriteReq
-        // (2) mem/ruby/system/RubyPort.cc converts these to
-        //     RubyRequestType_LD, RubyRequestType_IFETCH, RubyRequestType_ST
-        //     respectively
-        // (3) mem/ruby/system/Sequencer.cc sends these to the cache
-        //     controllers in the coherence protocol.
-        // (4) Network_test-cache.sm tags RubyRequestType:LD,
-        //     RubyRequestType:IFETCH and RubyRequestType:ST as
-        //     Request, Forward, and Response events respectively;
-        //     and injects them into virtual networks 0, 1 and 2
-        //     respectively. It immediately calls back the sequencer.
-        // (5) The packet traverses the network (simple/betaar) and reaches
-        //     its destination (Directory), and network stats are updated.
-        // (6) Network_test-dir.sm simply drops the packet.
-        //
-        MemCmd::Command requestType;
+    // Modeling different coherence msg types over different msg
+    // classes.
+    //
+    // BetaarSyntheticTraffic assumes the Garnet_standalone coherence
+    // protocol which models three message classes/virtual networks.
+    // These are: request, forward, response.
+    // requests and forwards are "control" packets (typically 8 bytes),
+    // while responses are "data" packets (typically 72 bytes).
+    //
+    // Life of a packet from the tester into the network:
+    // (1) This function generatePkt() generates packets of one of the
+    //     following 3 types (randomly) : ReadReq, INST_FETCH, WriteReq
+    // (2) mem/ruby/system/RubyPort.cc converts these to
+    //     RubyRequestType_LD, RubyRequestType_IFETCH, RubyRequestType_ST
+    //     respectively
+    // (3) mem/ruby/system/Sequencer.cc sends these to the cache
+    //     controllers in the coherence protocol.
+    // (4) Garnet_standalone-cache.sm tags RubyRequestType:LD,
+    //     RubyRequestType:IFETCH and RubyRequestType:ST as
+    //     Request, Forward, and Response events respectively;
+    //     and injects them into virtual networks 0, 1 and 2
+    //     respectively. It immediately calls back the sequencer.
+    // (5) The packet traverses the network (simple/betaar) and reaches
+    //     its destination(s) (Directory), and network stats are updated.
+    // (6) Garnet_standalone-dir.sm simply drops the packet.
+    //
+    MemCmd::Command requestType;
 
-        RequestPtr req = nullptr;
-        Request::Flags flags;
+    RequestPtr req = nullptr;
+    Request::Flags flags;
 
-        // Inject in specific Vnet
-        // Vnet 0 and 1 are for control packets (1-flit)
-        // Vnet 2 is for data packets (5-flit)
-        int injReqType = injVnet;
+    // Inject in specific Vnet
+    // Vnet 0 and 1 are for control packets (1-flit)
+    // Vnet 2 is for data packets (5-flit)
+    int injReqType = injVnet;
 
-        if (injReqType < 0 || injReqType > 2) {
-            // randomly inject in any vnet
-            injReqType = rng->random(0, 2);
-        }
-
-        if (injReqType == 0) {
-            // generate packet for virtual network 0
-            requestType = MemCmd::ReadReq;
-            req = std::make_shared<Request>(paddr, access_size, flags,
-                                            requestorId);
-        } else if (injReqType == 1) {
-            // generate packet for virtual network 1
-            requestType = MemCmd::ReadReq;
-            flags.set(Request::INST_FETCH);
-            req = std::make_shared<Request>(0x0, access_size, flags,
-                                            requestorId, 0x0, 0);
-            req->setPaddr(paddr);
-        } else { // if (injReqType == 2)
-            // generate packet for virtual network 2
-            requestType = MemCmd::WriteReq;
-            req = std::make_shared<Request>(paddr, access_size, flags,
-                                            requestorId);
-        }
-
-        req->setContext(id);
-
-        // No need to do functional simulation
-        // We just do timing simulation of the network
-
-        DPRINTF(BetaarSyntheticTraffic,
-                "Generated packet with destination %d, embedded in "
-                "address %x\n",
-                dest, req->getPaddr());
-
-        PacketPtr pkt = new Packet(req, requestType);
-        pkt->dataDynamic(new uint8_t[req->getSize()]);
-        pkt->senderState = NULL;
-
-        sendPkt(pkt);
+    if (injReqType < 0 || injReqType > 2) {
+        // randomly inject in any vnet
+        injReqType = rng->random(0, 2);
     }
+
+    if (injReqType == 0) {
+        // generate packet for virtual network 0
+        requestType = MemCmd::ReadReq;
+        req =
+            std::make_shared<Request>(paddr, access_size, flags, requestorId);
+    } else if (injReqType == 1) {
+        // generate packet for virtual network 1
+        requestType = MemCmd::ReadReq;
+        flags.set(Request::INST_FETCH);
+        req = std::make_shared<Request>(0x0, access_size, flags, requestorId,
+                                        0x0, 0);
+        req->setPaddr(paddr);
+    } else { // if (injReqType == 2)
+        // generate packet for virtual network 2
+        requestType = MemCmd::WriteReq;
+        req =
+            std::make_shared<Request>(paddr, access_size, flags, requestorId);
+    }
+
+    req->setContext(id);
+
+    if (destinations.size() > 1) {
+        uint64_t dest_mask = 0;
+        for (unsigned dest : destinations) {
+            panic_if(dest >= 64,
+                     "Multicast destination bitmask supports at most 64 "
+                     "destinations, got destination %d",
+                     dest);
+            dest_mask |= (uint64_t(1) << dest);
+        }
+        req->setExtraData(dest_mask);
+    }
+
+    // No need to do functional simulation
+    // We just do timing simulation of the network
+
+    DPRINTF(BetaarSyntheticTraffic,
+            "Generated packet for %d destination(s), first destination %d "
+            "embedded in address %x\n",
+            destinations.size(), destinations[0], req->getPaddr());
+
+    PacketPtr pkt = new Packet(req, requestType);
+    pkt->dataDynamic(new uint8_t[req->getSize()]);
+    pkt->senderState = NULL;
+
+    sendPkt(pkt);
 }
 
 void

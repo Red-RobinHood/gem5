@@ -66,6 +66,10 @@ machine(MachineType:L1Cache, "Garnet_standalone L1 Cache")
   // FUNCTIONS
   Tick clockEdge();
   MachineID mapAddressToMachine(Addr addr, MachineType mtype);
+  // Returns every destination of this request: the destination group
+  // encoded by a multicast traffic generator if there is one, otherwise
+  // just the single address-derived destination.
+  NetDest multicastDestination(PacketPtr pkt, MachineType mtype, Addr addr);
 
   // cpu/testers/networktest/networktest.cc generates packets of the type
   // ReadReq, INST_FETCH, and WriteReq.
@@ -141,37 +145,52 @@ machine(MachineType:L1Cache, "Garnet_standalone L1 Cache")
   // map_Address_to_Directory is used to retrieve it.
 
   action(a_issueRequest, "a", desc="Issue a request") {
-    enqueue(requestNetwork_out, RequestMsg, issue_latency) {
-      out_msg.addr := address;
-      out_msg.Type := CoherenceRequestType:MSG;
-      out_msg.Requestor := machineID;
-      out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+    peek(mandatoryQueue_in, RubyRequest) {
+      enqueue(requestNetwork_out, RequestMsg, issue_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:MSG;
+        out_msg.Requestor := machineID;
+        // One message for every destination of this request: a multicast
+        // group if the traffic generator produced one, otherwise the
+        // single address-derived directory.
+        out_msg.Destination := multicastDestination(in_msg.pkt,
+                                                    MachineType:Directory,
+                                                    address);
 
-      // To send broadcasts in vnet0 (to emulate broadcast-based protocols),
-      // replace the above line by the following:
-      // out_msg.Destination := broadcast(MachineType:Directory);
+        // To send broadcasts in vnet0 (to emulate broadcast-based protocols),
+        // replace the above line by the following:
+        // out_msg.Destination := broadcast(MachineType:Directory);
 
-      out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.MessageSize := MessageSizeType:Control;
+      }
     }
   }
 
   action(b_issueForward, "b", desc="Issue a forward") {
-    enqueue(forwardNetwork_out, RequestMsg, issue_latency) {
-      out_msg.addr := address;
-      out_msg.Type := CoherenceRequestType:MSG;
-      out_msg.Requestor := machineID;
-      out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
-      out_msg.MessageSize := MessageSizeType:Control;
+    peek(mandatoryQueue_in, RubyRequest) {
+      enqueue(forwardNetwork_out, RequestMsg, issue_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:MSG;
+        out_msg.Requestor := machineID;
+        out_msg.Destination := multicastDestination(in_msg.pkt,
+                                                    MachineType:Directory,
+                                                    address);
+        out_msg.MessageSize := MessageSizeType:Control;
+      }
     }
   }
 
   action(c_issueResponse, "c", desc="Issue a response") {
-    enqueue(responseNetwork_out, RequestMsg, issue_latency) {
-      out_msg.addr := address;
-      out_msg.Type := CoherenceRequestType:MSG;
-      out_msg.Requestor := machineID;
-      out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
-      out_msg.MessageSize := MessageSizeType:Data;
+    peek(mandatoryQueue_in, RubyRequest) {
+      enqueue(responseNetwork_out, RequestMsg, issue_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:MSG;
+        out_msg.Requestor := machineID;
+        out_msg.Destination := multicastDestination(in_msg.pkt,
+                                                    MachineType:Directory,
+                                                    address);
+        out_msg.MessageSize := MessageSizeType:Data;
+      }
     }
   }
 

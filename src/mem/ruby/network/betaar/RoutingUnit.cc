@@ -159,26 +159,68 @@ RoutingUnit::addOutDirection(PortDirection outport_dirn, int outport_idx)
     m_outports_idx2dirn[outport_idx] = outport_dirn;
 }
 
-// outportCompute() is called by the InputUnit
-// It calls the routing table by default.
-// A template for adaptive topology-specific routing algorithm
-// implementations using port directions rather than a static routing
-// table is provided here.
+// Merges dest into an existing branch targeting the same outport, or
+// appends a new branch if none exists yet. Used when bucketing a
+// multi-destination NetDest, since two different destinations can resolve
+// to the same outport (e.g. two local NIs behind the same "Local" port, or
+// -- in principle -- two routing-table entries sharing a link).
+static void
+mergeOrAddBranch(std::vector<RouteBranch> &branches, int outport,
+                 const NetDest &dest)
+{
+    for (auto &b : branches) {
+        if (b.outport == outport) {
+            b.dest_subset.addNetDest(dest);
+            return;
+        }
+    }
+    branches.emplace_back(outport, dest);
+}
 
-int
+// outportCompute() is called by the InputUnit.
+// Always returns at least one branch. Splits route.net_dest into
+// destinations local to this router (delivered to one or more attached
+// NIs) and remote destinations (dispatched to the configured routing
+// algorithm). A RouteInfo with a single destination degenerates to
+// exactly one branch everywhere below, so unicast behavior is unchanged.
+std::vector<RouteBranch>
 RoutingUnit::outportCompute(RouteInfo route, int inport,
                             PortDirection inport_dirn)
 {
-    int outport = -1;
+    std::vector<RouteBranch> branches;
+    RubySystem *rs = m_router->get_net_ptr()->getRubySystem();
 
-    if (route.dest_router == m_router->get_id()) {
+    NetDest remote_subset(rs);
+    bool have_remote = false;
 
-        // Multiple NIs may be connected to this router,
-        // all with output port direction = "Local"
-        // Get exact outport id from table
-        outport = lookupRoutingTable(route.vnet, route.net_dest);
-        return outport;
+    for (NodeID n : route.net_dest.getAllDest()) {
+        int dest_router =
+            m_router->get_net_ptr()->get_router_id(n, route.vnet);
+
+        NetDest single(rs);
+        single.add(nodeIDToMachineID(rs, n));
+
+        if (dest_router == m_router->get_id()) {
+            // Multiple NIs may be connected to this router, all with
+            // output port direction = "Local". Resolve per destination and
+            // merge subsets that resolve to the same outport, since a
+            // multicast message can have more than one destination local
+            // to this same router.
+            int outport = lookupRoutingTable(route.vnet, single);
+            mergeOrAddBranch(branches, outport, single);
+        } else {
+            remote_subset.addNetDest(single);
+            have_remote = true;
+        }
     }
+
+    if (!have_remote) {
+        assert(!branches.empty());
+        return branches;
+    }
+
+    RouteInfo remote_route = route;
+    remote_route.net_dest = remote_subset;
 
     // Routing Algorithm set in BetaarNetwork.py
     // Can be over-ridden from command line using --routing-algorithm = 1
@@ -186,34 +228,63 @@ RoutingUnit::outportCompute(RouteInfo route, int inport,
         (RoutingAlgorithm)m_router->get_net_ptr()->getRoutingAlgorithm();
 
     switch (routing_algorithm) {
-        case TABLE_:
-            outport = lookupRoutingTable(route.vnet, route.net_dest);
+        case XY_: {
+            for (auto &b : outportComputeMulticastXY(remote_route, inport,
+                                                     inport_dirn)) {
+                branches.push_back(b);
+            }
             break;
-        case XY_:
-            outport = outportComputeXY(route, inport, inport_dirn);
+        }
+        case TABLE_: {
+            fatal_if(remote_subset.count() > 1,
+                     "RoutingUnit: TABLE_ routing does not support "
+                     "multicast RouteInfo (remote destination count = %d)",
+                     remote_subset.count());
+            branches.emplace_back(
+                lookupRoutingTable(route.vnet, remote_subset), remote_subset);
             break;
+        }
         // any custom algorithm
-        case CUSTOM_:
-            outport = outportComputeCustom(route, inport, inport_dirn);
+        case CUSTOM_: {
+            fatal_if(remote_subset.count() > 1,
+                     "RoutingUnit: CUSTOM_ routing does not support "
+                     "multicast RouteInfo (remote destination count = %d)",
+                     remote_subset.count());
+            branches.emplace_back(
+                outportComputeCustom(remote_route, inport, inport_dirn),
+                remote_subset);
             break;
-        default:
-            outport = lookupRoutingTable(route.vnet, route.net_dest);
+        }
+        default: {
+            fatal_if(remote_subset.count() > 1,
+                     "RoutingUnit: default (table-based) routing does not "
+                     "support multicast RouteInfo (remote destination "
+                     "count = %d)",
+                     remote_subset.count());
+            branches.emplace_back(
+                lookupRoutingTable(route.vnet, remote_subset), remote_subset);
             break;
+        }
     }
 
-    assert(outport != -1);
-    return outport;
+    assert(!branches.empty());
+    return branches;
 }
 
-// XY routing implemented using port directions
-// Only for reference purpose in a Mesh
-// By default Betaar uses the routing table
-int
-RoutingUnit::outportComputeXY(RouteInfo route, int inport,
-                              PortDirection inport_dirn)
+// XY routing implemented using port directions, generalized to fan out a
+// multi-destination RouteInfo. route.net_dest here is guaranteed to
+// contain only REMOTE destinations (not local to this router -- those were
+// already peeled off by outportCompute()). Buckets every destination by
+// the direction it still needs to travel from this router -- East/West if
+// its target column hasn't been reached yet, North/South once it has --
+// and returns one branch per non-empty bucket (never empty; up to 4 when
+// destinations disagree on every direction, which can happen for
+// East+West right at/near the source before any single X direction has
+// been committed to).
+std::vector<RouteBranch>
+RoutingUnit::outportComputeMulticastXY(RouteInfo route, int inport,
+                                       PortDirection inport_dirn)
 {
-    PortDirection outport_dirn = "Unknown";
-
     [[maybe_unused]] int num_rows = m_router->get_net_ptr()->getNumRows();
     int num_cols = m_router->get_net_ptr()->getNumCols();
     assert(num_rows > 0 && num_cols > 0);
@@ -222,45 +293,57 @@ RoutingUnit::outportComputeXY(RouteInfo route, int inport,
     int my_x = my_id % num_cols;
     int my_y = my_id / num_cols;
 
-    int dest_id = route.dest_router;
-    int dest_x = dest_id % num_cols;
-    int dest_y = dest_id / num_cols;
+    RubySystem *rs = m_router->get_net_ptr()->getRubySystem();
+    NetDest bucket_E(rs), bucket_W(rs), bucket_N(rs), bucket_S(rs);
 
-    int x_hops = abs(dest_x - my_x);
-    int y_hops = abs(dest_y - my_y);
+    for (NodeID n : route.net_dest.getAllDest()) {
+        int dest_id = m_router->get_net_ptr()->get_router_id(n, route.vnet);
+        int dest_x = dest_id % num_cols;
+        int dest_y = dest_id / num_cols;
 
-    bool x_dirn = (dest_x >= my_x);
-    bool y_dirn = (dest_y >= my_y);
+        NetDest single(rs);
+        single.add(nodeIDToMachineID(rs, n));
 
-    // already checked that in outportCompute() function
-    assert(!(x_hops == 0 && y_hops == 0));
-
-    if (x_hops > 0) {
-        if (x_dirn) {
-            assert(inport_dirn == "Local" || inport_dirn == "West");
-            outport_dirn = "East";
+        if (dest_x > my_x) {
+            bucket_E.addNetDest(single);
+        } else if (dest_x < my_x) {
+            bucket_W.addNetDest(single);
+        } else if (dest_y > my_y) {
+            bucket_N.addNetDest(single);
+        } else if (dest_y < my_y) {
+            bucket_S.addNetDest(single);
         } else {
-            assert(inport_dirn == "Local" || inport_dirn == "East");
-            outport_dirn = "West";
+            // dest_x == my_x && dest_y == my_y: this destination is local
+            // to this router and should already have been peeled off by
+            // outportCompute() before this function was ever called.
+            panic("outportComputeMulticastXY: destination NodeID %d "
+                  "resolves to this router (%d) -- should have been routed "
+                  "locally by outportCompute()",
+                  n, my_id);
         }
-    } else if (y_hops > 0) {
-        if (y_dirn) {
-            // "Local" or "South" or "West" or "East"
-            assert(inport_dirn != "North");
-            outport_dirn = "North";
-        } else {
-            // "Local" or "North" or "West" or "East"
-            assert(inport_dirn != "South");
-            outport_dirn = "South";
-        }
-    } else {
-        // x_hops == 0 and y_hops == 0
-        // this is not possible
-        // already checked that in outportCompute() function
-        panic("x_hops == y_hops == 0");
     }
 
-    return m_outports_dirn2idx[outport_dirn];
+    std::vector<RouteBranch> branches;
+    if (!bucket_E.isEmpty()) {
+        assert(inport_dirn == "Local" || inport_dirn == "West");
+        branches.emplace_back(m_outports_dirn2idx["East"], bucket_E);
+    }
+    if (!bucket_W.isEmpty()) {
+        assert(inport_dirn == "Local" || inport_dirn == "East");
+        branches.emplace_back(m_outports_dirn2idx["West"], bucket_W);
+    }
+    if (!bucket_N.isEmpty()) {
+        assert(inport_dirn != "North");
+        branches.emplace_back(m_outports_dirn2idx["North"], bucket_N);
+    }
+    if (!bucket_S.isEmpty()) {
+        assert(inport_dirn != "South");
+        branches.emplace_back(m_outports_dirn2idx["South"], bucket_S);
+    }
+
+    assert(!branches.empty());
+    assert(branches.size() <= 4);
+    return branches;
 }
 
 // Template for implementing custom routing algorithm

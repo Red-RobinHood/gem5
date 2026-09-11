@@ -95,17 +95,26 @@ InputUnit::wakeup()
             assert(virtualChannels[vc].get_state() == IDLE_);
             set_vc_active(vc, curTick());
 
-            // Route computation for this vc
-            int outport = m_router->route_compute(t_flit->get_route(), m_id,
-                                                  m_direction);
+            // Route computation for this vc. May return more than one
+            // branch if this flit's destination set requires fanning out
+            // to multiple outports here (multicast XY routing).
+            std::vector<RouteBranch> branches = m_router->route_compute(
+                t_flit->get_route(), m_id, m_direction);
 
-            // Update output port in VC
-            // All flits in this packet will use this output port
-            // The output port field in the flit is updated after it wins SA
-            grant_outport(vc, outport);
+            // Update branch topology in VC.
+            // All flits in this packet will use these same branches.
+            // The output port/vc fields in each forwarded flit copy are
+            // updated after it wins SA (see SwitchAllocator).
+            set_branches(vc, branches);
 
         } else {
             assert(virtualChannels[vc].get_state() == ACTIVE_);
+            // BODY/TAIL flits reuse the branch topology computed for this
+            // packet's HEAD flit. The per-flit "already sent" bits are
+            // re-armed by SwitchAllocator when the preceding flit of this
+            // packet fully retires -- doing it here would clobber the
+            // in-progress retirement of a flit still sitting at the head
+            // of this VC's buffer.
         }
 
         // Buffer the flit

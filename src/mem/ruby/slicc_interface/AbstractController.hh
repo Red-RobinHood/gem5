@@ -233,6 +233,25 @@ class AbstractController : public ClockedObject, public Consumer
     MachineID mapAddressToDownstreamMachine(Addr addr,
                                     MachineType mtype = MachineType_NUM) const;
 
+    /**
+     * Build the destination set for a (possibly multicast) request.
+     *
+     * A traffic generator can encode a whole destination group in a
+     * request's extra data as a bitmask of node ids of the given machine
+     * type (see cpu/testers/betaar_synthetic_traffic). When that bitmask
+     * is present, every node in it becomes a destination of the single
+     * resulting message, which is what lets one message fan out inside a
+     * multicast-capable network instead of being sent as N unicasts.
+     * Requests without such a bitmask fall back to the ordinary single
+     * address-derived destination.
+     *
+     * @param the packet the request originated from (may be null)
+     * @param the type of the destination machines
+     * @param the destination address, used for the single-destination case
+     * @return the NetDest holding every destination of this message
+     */
+    NetDest multicastDestination(PacketPtr pkt, MachineType mtype, Addr addr);
+
     /** List of downstream destinations (towards memory) */
     const NetDest& allDownstreamDest() const { return downstreamDestinations; }
 

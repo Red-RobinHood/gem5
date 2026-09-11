@@ -78,28 +78,33 @@ class InputUnit : public Consumer
         virtualChannels[vc].set_active(curTime);
     }
 
+    // Replaces the old scalar grant_outport/grant_outvc/get_outport/
+    // get_outvc: a VC's packet may be routed onto several simultaneous
+    // branches (see VirtualChannel::Branch), so these are branch-list
+    // aware. Computed once at HEAD/HEAD_TAIL by InputUnit::wakeup(),
+    // reused by BODY/TAIL flits of the same packet.
     inline void
-    grant_outport(int vc, int outport)
+    set_branches(int vc, const std::vector<RouteBranch> &branches)
     {
-        virtualChannels[vc].set_outport(outport);
+        virtualChannels[vc].set_branches(branches);
+    }
+
+    inline std::vector<VirtualChannel::Branch> &
+    get_branches(int vc)
+    {
+        return virtualChannels[vc].get_branches();
     }
 
     inline void
-    grant_outvc(int vc, int outvc)
+    reset_branch_grants(int vc)
     {
-        virtualChannels[vc].set_outvc(outvc);
+        virtualChannels[vc].reset_branch_grants();
     }
 
-    inline int
-    get_outport(int invc)
+    inline bool
+    all_branches_sent(int vc)
     {
-        return virtualChannels[invc].get_outport();
-    }
-
-    inline int
-    get_outvc(int invc)
-    {
-        return virtualChannels[invc].get_outvc();
+        return virtualChannels[vc].all_branches_sent();
     }
 
     inline Tick

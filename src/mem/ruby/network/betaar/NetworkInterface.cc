@@ -376,10 +376,14 @@ bool
 NetworkInterface::flitisizeMessage(MsgPtr msg_ptr, int vnet)
 {
     Message *net_msg_ptr = msg_ptr.get();
+    // Full destination set for this message -- NEVER narrowed to a single
+    // destination here. A multicast message becomes exactly one packet_id
+    // / one flit stream, injected once; the routing fabric itself is
+    // responsible for splitting/replicating flits onto multiple outports
+    // as they cross the network (see RoutingUnit::outportCompute).
     NetDest net_msg_dest = net_msg_ptr->getDestination();
-
-    // gets all the destinations associated with this message.
     std::vector<NodeID> dest_nodes = net_msg_dest.getAllDest();
+    assert(!dest_nodes.empty());
 
     // Number of flits is dependent on the link bandwidth available.
     // This is expressed in terms of bytes/cycle or the flit size
@@ -393,77 +397,63 @@ NetworkInterface::flitisizeMessage(MsgPtr msg_ptr, int vnet)
             m_net_ptr->MessageSizeType_to_int(net_msg_ptr->getMessageSize()),
             vnet, oPort->bitWidth());
 
-    // loop to convert all multicast messages into unicast messages
-    for (int ctr = 0; ctr < dest_nodes.size(); ctr++) {
-
-        // this will return a free output virtual channel
-        int vc = calculateVC(vnet);
-
-        if (vc == -1) {
-            return false;
-        }
-        MsgPtr new_msg_ptr = msg_ptr->clone();
-        NodeID destID = dest_nodes[ctr];
-
-        Message *new_net_msg_ptr = new_msg_ptr.get();
-        if (dest_nodes.size() > 1) {
-            NetDest personal_dest(m_net_ptr->getRubySystem());
-            for (int m = 0; m < (int)MachineType_NUM; m++) {
-                if ((destID >= MachineType_base_number((MachineType)m)) &&
-                    destID < MachineType_base_number((MachineType)(m + 1))) {
-                    // calculating the NetDest associated with this destID
-                    personal_dest.clear();
-                    MachineID
-                        tempID; // because ISO C++ forbids compound-literals...
-                    tempID.type = (MachineType)m;
-                    tempID.num =
-                        destID - MachineType_base_number((MachineType)m);
-                    personal_dest.add(tempID);
-                    new_net_msg_ptr->getDestination() = personal_dest;
-                    break;
-                }
-            }
-            net_msg_dest.removeNetDest(personal_dest);
-            // removing the destination from the original message to reflect
-            // that a message with this particular destination has been
-            // flitisized and an output vc is acquired
-            net_msg_ptr->getDestination().removeNetDest(personal_dest);
-        }
-
-        // Embed Route into the flits
-        // NetDest format is used by the routing table
-        // Custom routing algorithms just need destID
-
-        RouteInfo route;
-        route.vnet = vnet;
-        route.net_dest = new_net_msg_ptr->getDestination();
-        route.src_ni = m_id;
-        route.src_router = oPort->routerID();
-        route.dest_ni = destID;
-        route.dest_router = m_net_ptr->get_router_id(destID, vnet);
-
-        // initialize hops_traversed to -1
-        // so that the first router increments it to 0
-        route.hops_traversed = -1;
-
-        m_net_ptr->increment_injected_packets(vnet);
-        m_net_ptr->update_traffic_distribution(route);
-        int packet_id = m_net_ptr->getNextPacketID();
-        for (int i = 0; i < num_flits; i++) {
-            m_net_ptr->increment_injected_flits(vnet);
-            flit *fl =
-                new flit(packet_id, i, vc, vnet, route, num_flits, new_msg_ptr,
-                         m_net_ptr->MessageSizeType_to_int(
-                             net_msg_ptr->getMessageSize()),
-                         oPort->bitWidth(), curTick());
-
-            fl->set_src_delay(curTick() - msg_ptr->getTime());
-            niOutVcs[vc].insert(fl);
-        }
-
-        m_ni_out_vcs_enqueue_time[vc] = curTick();
-        outVcState[vc].setState(ACTIVE_, curTick());
+    // Exactly one VC per message at the source NI -- same as unicast today,
+    // regardless of how many destinations this message has.
+    int vc = calculateVC(vnet);
+    if (vc == -1) {
+        return false;
     }
+
+    // Embed Route into the flits.
+    // route.net_dest carries the FULL destination set; dest_ni/dest_router
+    // are kept only as a representative destination (first in the set),
+    // used by TABLE_/CUSTOM_ routing -- which are unicast-only -- and by
+    // stats that expect a single scalar destination.
+    RouteInfo route;
+    route.vnet = vnet;
+    route.net_dest = net_msg_dest;
+    route.src_ni = m_id;
+    route.src_router = oPort->routerID();
+    route.dest_ni = dest_nodes[0];
+    route.dest_router = m_net_ptr->get_router_id(dest_nodes[0], vnet);
+
+    // initialize hops_traversed to -1
+    // so that the first router increments it to 0
+    route.hops_traversed = -1;
+
+    // One injected packet per message, regardless of destination count.
+    m_net_ptr->increment_injected_packets(vnet);
+
+    // update_traffic_distribution reflects the whole destination set in
+    // the traffic matrix; this is a stats-only side effect and does not
+    // affect the flit stream itself.
+    for (NodeID destID : dest_nodes) {
+        RouteInfo dest_route = route;
+        dest_route.dest_ni = destID;
+        dest_route.dest_router = m_net_ptr->get_router_id(destID, vnet);
+        m_net_ptr->update_traffic_distribution(dest_route);
+    }
+
+    // NOTE: msg_ptr is shared (not cloned) across every flit -- including
+    // every fork-created copy inside the network -- because the
+    // Garnet_standalone protocol never re-reads a message's Destination
+    // field after injection. A coherence protocol that does read
+    // getDestination() post-delivery would need per-branch message
+    // narrowing instead; out of scope here.
+    int packet_id = m_net_ptr->getNextPacketID();
+    for (int i = 0; i < num_flits; i++) {
+        m_net_ptr->increment_injected_flits(vnet);
+        flit *fl = new flit(
+            packet_id, i, vc, vnet, route, num_flits, msg_ptr,
+            m_net_ptr->MessageSizeType_to_int(net_msg_ptr->getMessageSize()),
+            oPort->bitWidth(), curTick());
+
+        fl->set_src_delay(curTick() - msg_ptr->getTime());
+        niOutVcs[vc].insert(fl);
+    }
+
+    m_ni_out_vcs_enqueue_time[vc] = curTick();
+    outVcState[vc].setState(ACTIVE_, curTick());
     return true;
 }
 
